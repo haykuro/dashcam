@@ -584,6 +584,7 @@
         let thumbnailsTaskId = 0;
         let currentMode = 'single'; // 'single' | 'grid'
         let gridCameras = []; // [{ camera, fileName, mp4, frames, firstKeyframe, config, canvas, ctx }]
+        let lastGridFrameIndex = -1;
         let currentConfig = null;
 
         // DOM
@@ -1032,8 +1033,13 @@
             frameNum.textContent = `Frame ${clamped + 1}/${frames.length}`;
             renderSei(frames[clamped].sei);
             if (currentMode === 'grid') {
-                renderGridFrame(clamped);
-                return;
+                // In grid mode, always render the primary camera via the main decoder (below),
+                // but throttle secondary camera updates so playback stays smooth.
+                const stride = playing ? 4 : 1; // when playing, update other cameras every 4th frame
+                if (!playing || clamped % stride === 0 || clamped === 0 || clamped === frames.length - 1) {
+                    lastGridFrameIndex = clamped;
+                    renderGridFrame(clamped);
+                }
             }
             if (decoding) { pendingFrame = clamped; return; }
             decodeFrame(clamped);
