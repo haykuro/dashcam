@@ -218,6 +218,7 @@
             display: flex;
             align-items: center;
             justify-content: center;
+            overflow: hidden;
         }
 
         .video-wrap canvas {
@@ -579,6 +580,8 @@
         let decoder = null, decoding = false, pendingFrame = null;
         let playing = false, playTimer = null;
         let thumbnailsTaskId = 0;
+        let currentMode = 'single'; // 'single' | 'grid'
+        let gridCameras = []; // [{ camera, fileName, mp4, frames, firstKeyframe, config, canvas, ctx }]
 
         // DOM
         const $ = id => document.getElementById(id);
@@ -871,7 +874,13 @@
             renderFileList();
             const entry = loadedFiles[index];
 
-            // Always load a single file; tree is organizational only
+            // If parent row (no cameraKey) and we have multiple cameras, show grid view
+            if (!cameraKey && entry.files.length > 1 && 'VideoDecoder' in window && 'EncodedVideoChunk' in window) {
+                loadEventGrid(entry);
+                return;
+            }
+
+            // Single file / specific camera selected
             let fileToLoad = null;
             if (cameraKey) {
                 const hit = entry.files.find(f => (f.camera || f.file.name) === cameraKey);
@@ -896,6 +905,8 @@
             frames = null;
             firstKeyframe = 0;
             currentFileName = null;
+            currentMode = 'single';
+            gridCameras = [];
             videoGrid.classList.remove('active');
             videoGrid.innerHTML = '';
             canvas.style.display = '';
@@ -925,6 +936,8 @@
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
             try {
+                currentMode = 'single';
+                gridCameras = [];
                 videoGrid.classList.remove('active');
                 videoGrid.innerHTML = '';
                 canvas.style.display = '';
@@ -935,8 +948,8 @@
                 if (firstKeyframe === -1) throw new Error('No keyframes found');
 
                 const config = mp4.getConfig();
-                canvas.width = config.width;
-                canvas.height = config.height;
+                canvas.width = 'auto';
+                canvas.height = '100%';
                 slider.max = frames.length - 1;
                 slider.value = firstKeyframe;
                 dropOverlay.classList.add('hidden');
@@ -991,6 +1004,10 @@
             const clamped = Math.max(0, Math.min(frames.length - 1, index));
             frameNum.textContent = `Frame ${clamped + 1}/${frames.length}`;
             renderSei(frames[clamped].sei);
+            if (currentMode === 'grid') {
+                renderGridFrame(clamped);
+                return;
+            }
             if (decoding) { pendingFrame = clamped; return; }
             decodeFrame(clamped);
         }
@@ -1030,6 +1047,170 @@
                 decoding = false;
                 if (pendingFrame !== null) { const n = pendingFrame; pendingFrame = null; decodeFrame(n); }
             }
+        }
+
+        async function loadEventGrid(entry) {
+            if (!entry || !entry.files.length) return;
+            if (!seiType) { alert('Protobuf not initialized'); return; }
+
+            pause();
+            if (decoder) { try { decoder.close(); } catch { } decoder = null; }
+            metaList.innerHTML = '';
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            currentMode = 'grid';
+            gridCameras = [];
+            videoGrid.classList.add('active');
+            videoGrid.innerHTML = '';
+            canvas.style.display = 'none';
+
+            try {
+                // Load all cameras for this event
+                const cameraResults = await Promise.all(entry.files.map(async ({ file, camera }) => {
+                    const mp4Local = new DashcamMP4(await file.arrayBuffer());
+                    const framesLocal = mp4Local.parseFrames(seiType);
+                    const firstKey = framesLocal.findIndex(f => f.keyframe);
+                    if (firstKey === -1) throw new Error(`No keyframes found in ${file.name}`);
+                    const configLocal = mp4Local.getConfig();
+                    return {
+                        camera: camera || file.name,
+                        fileName: file.name,
+                        mp4: mp4Local,
+                        frames: framesLocal,
+                        firstKeyframe: firstKey,
+                        config: configLocal
+                    };
+                }));
+
+                if (!cameraResults.length) throw new Error('No playable camera clips for this event');
+
+                // Choose primary camera (front if available)
+                let primaryIndex = cameraResults.findIndex(c => c.camera === 'front');
+                if (primaryIndex === -1) primaryIndex = 0;
+                const primary = cameraResults[primaryIndex];
+
+                // Use primary camera for SEI / slider / thumbnails
+                mp4 = primary.mp4;
+                frames = primary.frames;
+                firstKeyframe = primary.firstKeyframe;
+                currentFileName = primary.fileName;
+
+                const config = primary.config;
+                canvas.width = config.width;
+                canvas.height = config.height;
+                slider.max = frames.length - 1;
+                slider.value = firstKeyframe;
+                dropOverlay.classList.add('hidden');
+
+                const tsLabel = formatRecordingLabel(entry);
+                fileName.textContent = tsLabel || primary.fileName;
+                exportBtn.disabled = false;
+                playBtn.disabled = false;
+                slider.disabled = false;
+
+                // Build grid canvases (up to 4 cameras)
+                gridCameras = cameraResults.slice(0, 4).map(info => {
+                    const c = document.createElement('canvas');
+                    c.width = info.config.width;
+                    c.height = info.config.height;
+                    c.title = info.camera.toUpperCase();
+                    videoGrid.appendChild(c);
+                    return {
+                        ...info,
+                        canvas: c,
+                        ctx: c.getContext('2d')
+                    };
+                });
+
+                showFrame(firstKeyframe);
+                generateThumbnails().catch(() => { });
+            } catch (err) {
+                currentMode = 'single';
+                gridCameras = [];
+                videoGrid.classList.remove('active');
+                videoGrid.innerHTML = '';
+                canvas.style.display = '';
+
+                mp4 = null;
+                frames = null;
+                firstKeyframe = 0;
+                currentFileName = null;
+                slider.max = 0;
+                slider.value = 0;
+                frameNum.textContent = 'Frame 0/0';
+                fileName.textContent = 'No file loaded';
+                exportBtn.disabled = true;
+                playBtn.disabled = true;
+                slider.disabled = true;
+                dropOverlay.classList.remove('hidden');
+                alert(err.message);
+            }
+        }
+
+        async function renderGridFrame(index) {
+            if (!gridCameras.length || !('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) return;
+
+            const tasks = gridCameras.map(async info => {
+                const localFrames = info.frames;
+                if (!localFrames.length) return;
+                const localIndex = Math.max(0, Math.min(localFrames.length - 1, index));
+                try {
+                    await decodeFrameToCanvasGrid(localFrames, info.mp4, localIndex, info.ctx, info.config);
+                } catch {
+                    // ignore per-camera decode failures
+                }
+            });
+            await Promise.allSettled(tasks);
+        }
+
+        async function decodeFrameToCanvasGrid(localFrames, localMp4, index, targetCtx, config) {
+            return new Promise((resolve, reject) => {
+                let keyIdx = index;
+                while (keyIdx >= 0 && !localFrames[keyIdx].keyframe) keyIdx--;
+                if (keyIdx < 0) { resolve(); return; }
+
+                let count = 0;
+                const target = index - keyIdx + 1;
+
+                const decoder = new VideoDecoder({
+                    output: frame => {
+                        try {
+                            if (++count === target) {
+                                targetCtx.drawImage(frame, 0, 0, targetCtx.canvas.width, targetCtx.canvas.height);
+                            }
+                        } finally {
+                            frame.close();
+                        }
+                        if (count >= target) {
+                            decoder.close();
+                            resolve();
+                        }
+                    },
+                    error: e => {
+                        try { decoder.close(); } catch { }
+                        reject(e);
+                    }
+                });
+
+                decoder.configure({ codec: config.codec, width: config.width, height: config.height });
+                for (let i = keyIdx; i <= index; i++) {
+                    const frame = localFrames[i];
+                    const sc = new Uint8Array([0, 0, 0, 1]);
+                    const data = frame.keyframe
+                        ? DashcamMP4.concat(sc, frame.sps || config.sps, sc, frame.pps || config.pps, sc, frame.data)
+                        : DashcamMP4.concat(sc, frame.data);
+                    const chunk = new EncodedVideoChunk({
+                        type: frame.keyframe ? 'key' : 'delta',
+                        timestamp: frame.index * 33333,
+                        data
+                    });
+                    decoder.decode(chunk);
+                }
+                decoder.flush().catch(err => {
+                    try { decoder.close(); } catch { }
+                    reject(err);
+                });
+            });
         }
 
         function createChunk(frame) {
