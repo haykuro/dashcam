@@ -542,6 +542,7 @@
                             <polygon points="6,4 20,12 6,20" />
                         </svg>
                     </button>
+                    <button id="jump2Btn" title="Jump forward 2 seconds" disabled>+2s</button>
                     <input type="range" id="slider" min="0" max="0" value="0" disabled>
                 </div>
                 <div class="thumb-strip" id="thumbStrip"></div>
@@ -591,7 +592,7 @@
         const $ = id => document.getElementById(id);
         const dropOverlay = $('dropOverlay'), fileInput = $('fileInput');
         const canvas = $('canvas'), ctx = canvas.getContext('2d');
-        const slider = $('slider'), playBtn = $('playBtn'), exportBtn = $('exportBtn');
+        const slider = $('slider'), playBtn = $('playBtn'), jump2Btn = $('jump2Btn'), exportBtn = $('exportBtn');
         const frameNum = $('frameNum'), fileName = $('fileName'), metaList = $('metaList');
         const thumbStrip = $('thumbStrip');
         const videoGrid = $('videoGrid');
@@ -746,6 +747,31 @@
             videoGrid.style.transform = `scale(${scale})`;
         }
 
+        function jumpByMs(ms) {
+            if (!frames || !mp4 || !slider) return;
+            const config = mp4.getConfig();
+            const durations = config.durations || [];
+            if (!durations.length) return;
+
+            let idx = +slider.value;
+            let remaining = Math.abs(ms);
+
+            if (ms > 0) {
+                while (idx < frames.length - 1 && remaining > 0) {
+                    remaining -= durations[idx] || 0;
+                    idx++;
+                }
+            } else if (ms < 0) {
+                while (idx > 0 && remaining > 0) {
+                    idx--;
+                    remaining -= durations[idx] || 0;
+                }
+            }
+
+            slider.value = idx;
+            showFrame(idx);
+        }
+
         // Events
         dropOverlay.onclick = () => fileInput.click();
         fileInput.onchange = e => { handleFiles(e.target.files); e.target.value = ''; };
@@ -769,13 +795,16 @@
             if (!frames) return;
             if (e.key === ' ') {
                 e.preventDefault(); playing ? pause() : play();
-            } else if (e.key === 'ArrowLeft' && +slider.value > 0) {
+            } else if (e.key === 'ArrowLeft' && !e.shiftKey && +slider.value > 0) {
                 e.preventDefault(); pause(); slider.value = +slider.value - 1; showFrame(+slider.value);
+            } else if (e.key === 'ArrowRight' && e.shiftKey) {
+                e.preventDefault(); pause(); jumpByMs(2000);
             } else if (e.key === 'ArrowRight' && +slider.value < frames.length - 1) {
                 e.preventDefault(); pause(); slider.value = +slider.value + 1; showFrame(+slider.value);
             }
         };
         exportBtn.onclick = exportCsv;
+        jump2Btn.onclick = () => jumpByMs(2000);
         clearFilesBtn.onclick = clearFiles;
 
         // Initialize protobuf
@@ -984,6 +1013,7 @@
                 fileName.textContent = file.name;
                 exportBtn.disabled = false;
                 playBtn.disabled = false;
+                jump2Btn.disabled = false;
                 slider.disabled = false;
                 showFrame(firstKeyframe);
                 generateThumbnails().catch(() => { });
@@ -999,6 +1029,7 @@
                 fileName.textContent = 'No file loaded';
                 exportBtn.disabled = true;
                 playBtn.disabled = true;
+                jump2Btn.disabled = true;
                 slider.disabled = true;
                 dropOverlay.classList.remove('hidden');
                 alert(err.message);
