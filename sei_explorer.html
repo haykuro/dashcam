@@ -109,6 +109,100 @@
             gap: 0.5rem;
         }
 
+        /* ===== FILE LIST PANEL ===== */
+        .file-panel {
+            flex-shrink: 0;
+            background: var(--bg-panel);
+            border-radius: 6px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            max-height: 40%;
+        }
+
+        .file-panel-header {
+            padding: 0.4rem 0.75rem;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.75rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .file-panel-header span {
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-muted);
+        }
+
+        .file-clear-btn {
+            border: none;
+            background: none;
+            color: var(--text-muted);
+            font-size: 0.7rem;
+            cursor: pointer;
+            padding: 0;
+        }
+
+        .file-clear-btn:hover {
+            color: var(--accent);
+        }
+
+        .file-list {
+            padding: 0.25rem 0;
+            overflow-y: auto;
+        }
+
+        .file-item {
+            width: 100%;
+            text-align: left;
+            border: none;
+            background: transparent;
+            color: var(--text);
+            font-size: 0.75rem;
+            padding: 0.25rem 0.75rem;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            gap: 0.1rem;
+        }
+
+        .file-item-main {
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .file-item-sub {
+            font-size: 0.65rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .file-item:hover {
+            background: rgba(0, 0, 0, 0.05);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .file-item:hover {
+                background: rgba(255, 255, 255, 0.04);
+            }
+        }
+
+        .file-item.active {
+            background: rgba(0, 128, 255, 0.12);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .file-item.active {
+                background: rgba(255, 0, 51, 0.16);
+            }
+        }
+
         /* ===== VIDEO AREA ===== */
         .video-wrap {
             flex: 1;
@@ -398,6 +492,13 @@
             </section>
 
             <aside class="meta-section">
+                <div class="file-panel">
+                    <div class="file-panel-header">
+                        <span>Files</span>
+                        <button class="file-clear-btn" id="clearFilesBtn" type="button">Clear</button>
+                    </div>
+                    <div class="file-list" id="fileList"></div>
+                </div>
                 <div class="meta-panel">
                     <div class="meta-header">
                         <div class="filename" id="fileName">No file loaded</div>
@@ -418,6 +519,9 @@
         let seiType = null, seiFields = null, seiFieldsCsv = null;
         let mp4 = null, frames = null, firstKeyframe = 0;
         let currentFileName = null;
+        // loadedFiles: { file: File, sortKey: number | null }
+        let loadedFiles = [];
+        let currentFileIndex = -1;
         let decoder = null, decoding = false, pendingFrame = null;
         let playing = false, playTimer = null;
 
@@ -427,6 +531,36 @@
         const canvas = $('canvas'), ctx = canvas.getContext('2d');
         const slider = $('slider'), playBtn = $('playBtn'), exportBtn = $('exportBtn');
         const frameNum = $('frameNum'), fileName = $('fileName'), metaList = $('metaList');
+        const fileListEl = $('fileList'), clearFilesBtn = $('clearFilesBtn');
+
+        // Helpers
+        function parseRecordingDateFromName(name) {
+            // Typical Tesla dashcam filename pattern: YYYY-MM-DD_HH-MM-SS-*.mp4
+            const m = name.match(/(\d{4})-(\d{2})-(\d{2})[_T](\d{2})-(\d{2})-(\d{2})/);
+            if (!m) return null;
+            const [_, year, month, day, hour, min, sec] = m;
+            const d = new Date(
+                Number(year),
+                Number(month) - 1,
+                Number(day),
+                Number(hour),
+                Number(min),
+                Number(sec)
+            );
+            return isNaN(d.getTime()) ? null : d;
+        }
+
+        function formatRecordingLabel(entry) {
+            if (!entry.sortKey) return null;
+            const d = new Date(entry.sortKey);
+            const yyyy = d.getFullYear();
+            const mm = String(d.getMonth() + 1).padStart(2, '0');
+            const dd = String(d.getDate()).padStart(2, '0');
+            const hh = String(d.getHours()).padStart(2, '0');
+            const mi = String(d.getMinutes()).padStart(2, '0');
+            const ss = String(d.getSeconds()).padStart(2, '0');
+            return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+        }
 
         // Events
         dropOverlay.onclick = () => fileInput.click();
@@ -457,6 +591,7 @@
             }
         };
         exportBtn.onclick = exportCsv;
+        clearFilesBtn.onclick = clearFiles;
 
         // Initialize protobuf
         DashcamHelpers.initProtobuf().then(({ SeiMetadata, enumFields }) => {
@@ -476,25 +611,101 @@
                 .filter(f => f.name.toLowerCase().endsWith('.mp4'));
             if (!files.length) { alert('Please choose at least one MP4 file.'); return; }
 
-            // Single file: load and display video
-            if (files.length === 1) { loadFile(files[0]); return; }
+            // Remember currently selected file (if any) so we can restore selection after sorting
+            const currentFile = currentFileIndex >= 0 && currentFileIndex < loadedFiles.length
+                ? loadedFiles[currentFileIndex].file
+                : null;
 
-            // Multiple files: extract metadata and create zip
-            const zip = new JSZip();
-            let exported = 0;
+            // Add to in-memory file list (avoid simple duplicates by name+size)
             for (const file of files) {
-                try {
-                    const mp4 = new DashcamMP4(await file.arrayBuffer());
-                    const messages = mp4.extractSeiMessages(seiType);
-                    if (messages.length) {
-                        zip.file(file.name.replace(/\.mp4$/i, '_sei.csv'), DashcamHelpers.buildCsv(messages, seiFieldsCsv));
-                        exported++;
-                    }
-                } catch { }
+                const exists = loadedFiles.some(f => f.file.name === file.name && f.file.size === file.size);
+                if (exists) continue;
+                const dt = parseRecordingDateFromName(file.name);
+                loadedFiles.push({
+                    file,
+                    sortKey: dt ? dt.getTime() : null
+                });
             }
-            if (!exported) { alert('No files produced SEI metadata.'); return; }
-            DashcamHelpers.downloadBlob(await zip.generateAsync({ type: 'blob' }), directoryName ? `${directoryName}_sei.zip` : 'dashcam_sei_metadata.zip');
-            alert(`Exported ${exported} CSV${exported > 1 ? 's' : ''} as ZIP. To view a clip, select a single file.`);
+
+            // Sort by recording time (newest first), unknown timestamps last by name
+            loadedFiles.sort((a, b) => {
+                if (a.sortKey && b.sortKey) return b.sortKey - a.sortKey;
+                if (a.sortKey && !b.sortKey) return -1;
+                if (!a.sortKey && b.sortKey) return 1;
+                return a.file.name.localeCompare(b.file.name);
+            });
+
+            // Restore current selection index after sort
+            if (currentFile) {
+                currentFileIndex = loadedFiles.findIndex(e => e.file === currentFile);
+            }
+
+            renderFileList();
+
+            // If nothing loaded yet, automatically load the first item (newest recording)
+            if (currentFileIndex === -1 && loadedFiles.length) {
+                selectFile(0);
+            }
+        }
+
+        function renderFileList() {
+            fileListEl.innerHTML = '';
+            if (!loadedFiles.length) return;
+            loadedFiles.forEach((entry, index) => {
+                const file = entry.file;
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'file-item' + (index === currentFileIndex ? ' active' : '');
+
+                const main = document.createElement('div');
+                main.className = 'file-item-main';
+                main.textContent = file.name;
+
+                const sub = document.createElement('div');
+                sub.className = 'file-item-sub';
+                const tsLabel = formatRecordingLabel(entry);
+                if (tsLabel) {
+                    sub.textContent = tsLabel;
+                } else {
+                    const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+                    sub.textContent = `${sizeMb} MB`;
+                }
+
+                btn.appendChild(main);
+                btn.appendChild(sub);
+                btn.onclick = () => selectFile(index);
+                fileListEl.appendChild(btn);
+            });
+        }
+
+        function selectFile(index) {
+            if (index < 0 || index >= loadedFiles.length) return;
+            currentFileIndex = index;
+            renderFileList();
+            const file = loadedFiles[index].file;
+            loadFile(file);
+        }
+
+        function clearFiles() {
+            loadedFiles = [];
+            currentFileIndex = -1;
+            fileListEl.innerHTML = '';
+            pause();
+            if (decoder) { try { decoder.close(); } catch { } decoder = null; }
+            mp4 = null;
+            frames = null;
+            firstKeyframe = 0;
+            currentFileName = null;
+            slider.max = 0;
+            slider.value = 0;
+            slider.disabled = true;
+            playBtn.disabled = true;
+            exportBtn.disabled = true;
+            frameNum.textContent = 'Frame 0/0';
+            fileName.textContent = 'No file loaded';
+            metaList.innerHTML = '';
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            dropOverlay.classList.remove('hidden');
         }
 
         async function loadFile(file) {
