@@ -224,6 +224,8 @@
         .video-wrap canvas {
             max-width: 100%;
             max-height: 100%;
+            width: auto;
+            height: auto;
         }
 
         .video-grid {
@@ -582,6 +584,7 @@
         let thumbnailsTaskId = 0;
         let currentMode = 'single'; // 'single' | 'grid'
         let gridCameras = []; // [{ camera, fileName, mp4, frames, firstKeyframe, config, canvas, ctx }]
+        let currentConfig = null;
 
         // DOM
         const $ = id => document.getElementById(id);
@@ -591,6 +594,7 @@
         const frameNum = $('frameNum'), fileName = $('fileName'), metaList = $('metaList');
         const thumbStrip = $('thumbStrip');
         const videoGrid = $('videoGrid');
+        const videoWrap = document.querySelector('.video-wrap');
         const fileListEl = $('fileList'), clearFilesBtn = $('clearFilesBtn');
 
         // Helpers
@@ -721,6 +725,26 @@
             });
         }
 
+        function updateGridScale() {
+            if (!videoGrid.classList.contains('active') || !currentConfig || !videoWrap) {
+                videoGrid.style.transform = '';
+                return;
+            }
+            const wrapW = videoWrap.clientWidth;
+            const wrapH = videoWrap.clientHeight;
+            if (!wrapW || !wrapH) return;
+
+            // Approximate grid height from width and video aspect ratio.
+            const tileAspect = currentConfig.height / currentConfig.width || (9 / 16);
+            const tileWidth = wrapW / 2;
+            const idealTileHeight = tileWidth * tileAspect;
+            const idealGridHeight = idealTileHeight * 2;
+
+            const scale = Math.min(1, wrapH / idealGridHeight);
+            videoGrid.style.transformOrigin = 'top center';
+            videoGrid.style.transform = `scale(${scale})`;
+        }
+
         // Events
         dropOverlay.onclick = () => fileInput.click();
         fileInput.onchange = e => { handleFiles(e.target.files); e.target.value = ''; };
@@ -737,6 +761,7 @@
                 handleFiles(e.dataTransfer?.files ?? []);
             }
         };
+        window.addEventListener('resize', () => updateGridScale());
         slider.oninput = () => { pause(); showFrame(+slider.value); };
         playBtn.onclick = () => playing ? pause() : play();
         document.onkeydown = e => {
@@ -948,8 +973,9 @@
                 if (firstKeyframe === -1) throw new Error('No keyframes found');
 
                 const config = mp4.getConfig();
-                canvas.width = 'auto';
-                canvas.height = '100%';
+                currentConfig = config;
+                canvas.width = config.width;
+                canvas.height = config.height;
                 slider.max = frames.length - 1;
                 slider.value = firstKeyframe;
                 dropOverlay.classList.add('hidden');
@@ -960,6 +986,7 @@
                 slider.disabled = false;
                 showFrame(firstKeyframe);
                 generateThumbnails().catch(() => { });
+                updateGridScale();
             } catch (err) {
                 mp4 = null;
                 frames = null;
@@ -1096,6 +1123,7 @@
                 currentFileName = primary.fileName;
 
                 const config = primary.config;
+                currentConfig = config;
                 canvas.width = config.width;
                 canvas.height = config.height;
                 slider.max = frames.length - 1;
@@ -1124,6 +1152,7 @@
 
                 showFrame(firstKeyframe);
                 generateThumbnails().catch(() => { });
+                updateGridScale();
             } catch (err) {
                 currentMode = 'single';
                 gridCameras = [];
