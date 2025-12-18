@@ -1,4 +1,4 @@
-### Haykuro Enhancements
+# Haykuro Enhancements
 
 - **Multi-file event browser**
   - Organizes clips by **recorded timestamp**, grouping the typical Tesla `front/back/left/right` files for a single event under one parent row.
@@ -11,6 +11,9 @@
 - **Thumbnail timeline**
   - Displays a strip of **evenly spaced frame thumbnails** under the seek bar.
   - Clicking a thumbnail jumps directly to that frame, making it easier to spot and navigate to significant events.
+
+### Screenshot
+<img width="1661" height="821" alt="image" src="https://github.com/user-attachments/assets/c902e80a-04ce-401a-8bca-48c3b6c8e9c7" />
 
 ---
 
