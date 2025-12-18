@@ -168,6 +168,11 @@
             gap: 0.1rem;
         }
 
+        .file-item.file-item-child {
+            padding-left: 1.5rem;
+            font-size: 0.72rem;
+        }
+
         .file-item-main {
             font-weight: 500;
             white-space: nowrap;
@@ -218,6 +223,30 @@
         .video-wrap canvas {
             max-width: 100%;
             max-height: 100%;
+        }
+
+        .video-grid {
+            position: absolute;
+            inset: 0;
+            padding: 4px;
+            box-sizing: border-box;
+            gap: 4px;
+            display: none;
+            pointer-events: none;
+        }
+
+        .video-grid.active {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            grid-auto-rows: 1fr;
+        }
+
+        .video-grid canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #000;
+            border-radius: 4px;
         }
 
         /* Drop overlay */
@@ -339,6 +368,28 @@
         .scrubber input[type="range"]:disabled {
             opacity: 0.5;
             cursor: not-allowed;
+        }
+
+        /* Thumbnail strip under scrubber */
+        .thumb-strip {
+            margin-top: 0.3rem;
+            height: 60px;
+            display: flex;
+            align-items: center;
+            gap: 3px;
+            overflow-x: auto;
+            padding-bottom: 2px;
+        }
+
+        .thumb-strip canvas {
+            flex: 0 0 auto;
+            height: 100%;
+            border-radius: 3px;
+            background: #000;
+        }
+
+        .thumb-strip canvas:hover {
+            outline: 2px solid var(--accent);
         }
 
         /* ===== METADATA PANEL ===== */
@@ -479,6 +530,7 @@
                         <input type="file" id="fileInput" accept="video/mp4" multiple>
                         <p>Drop MP4 here or click to select</p>
                     </div>
+                    <div class="video-grid" id="videoGrid"></div>
                     <canvas id="canvas"></canvas>
                 </div>
                 <div class="scrubber">
@@ -489,6 +541,7 @@
                     </button>
                     <input type="range" id="slider" min="0" max="0" value="0" disabled>
                 </div>
+                <div class="thumb-strip" id="thumbStrip"></div>
             </section>
 
             <aside class="meta-section">
@@ -519,11 +572,13 @@
         let seiType = null, seiFields = null, seiFieldsCsv = null;
         let mp4 = null, frames = null, firstKeyframe = 0;
         let currentFileName = null;
-        // loadedFiles: { file: File, sortKey: number | null }
+        // loadedFiles: { key: string, sortKey: number | null, files: Array<{ file: File, camera: string | null }> }
         let loadedFiles = [];
         let currentFileIndex = -1;
+        let currentCamera = null; // null = default (e.g. front) for that entry
         let decoder = null, decoding = false, pendingFrame = null;
         let playing = false, playTimer = null;
+        let thumbnailsTaskId = 0;
 
         // DOM
         const $ = id => document.getElementById(id);
@@ -531,6 +586,8 @@
         const canvas = $('canvas'), ctx = canvas.getContext('2d');
         const slider = $('slider'), playBtn = $('playBtn'), exportBtn = $('exportBtn');
         const frameNum = $('frameNum'), fileName = $('fileName'), metaList = $('metaList');
+        const thumbStrip = $('thumbStrip');
+        const videoGrid = $('videoGrid');
         const fileListEl = $('fileList'), clearFilesBtn = $('clearFilesBtn');
 
         // Helpers
@@ -560,6 +617,105 @@
             const mi = String(d.getMinutes()).padStart(2, '0');
             const ss = String(d.getSeconds()).padStart(2, '0');
             return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+        }
+
+        function parseCameraFromName(name) {
+            // Expect suffix like "-front.mp4", "-back.mp4", "-left_repeater.mp4", etc.
+            const m = name.match(/-([a-zA-Z_]+)\.mp4$/i);
+            if (!m) return null;
+            const raw = m[1].toLowerCase();
+            if (raw.includes('front')) return 'front';
+            if (raw.includes('back') || raw.includes('rear')) return 'back';
+            if (raw.includes('left')) return 'left';
+            if (raw.includes('right')) return 'right';
+            return raw;
+        }
+
+        async function generateThumbnails() {
+            thumbnailsTaskId++;
+            const taskId = thumbnailsTaskId;
+            thumbStrip.innerHTML = '';
+
+            if (!mp4 || !frames || !frames.length) return;
+            if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) return;
+
+            const config = mp4.getConfig();
+            const maxThumbs = Math.min(24, frames.length);
+            const start = firstKeyframe >= 0 ? firstKeyframe : 0;
+            const span = frames.length - start;
+            if (span <= 0) return;
+
+            const indices = [];
+            for (let i = 0; i < maxThumbs; i++) {
+                const t = i / (maxThumbs - 1 || 1);
+                const idx = Math.min(frames.length - 1, start + Math.floor(t * (span - 1)));
+                if (!indices.includes(idx)) indices.push(idx);
+            }
+
+            const thumbHeight = thumbStrip.clientHeight || 60;
+            const thumbWidth = Math.round(thumbHeight * (config.width / config.height));
+
+            for (const index of indices) {
+                if (taskId !== thumbnailsTaskId) return;
+
+                const c = document.createElement('canvas');
+                c.width = thumbWidth;
+                c.height = thumbHeight;
+                c.dataset.index = String(index);
+                c.title = `Frame ${index + 1}`;
+                c.onclick = () => {
+                    pause();
+                    slider.value = index;
+                    showFrame(index);
+                };
+                thumbStrip.appendChild(c);
+
+                try {
+                    await decodeFrameToCanvas(index, c.getContext('2d'), config);
+                } catch {
+                    // ignore thumbnail decode failures
+                }
+            }
+        }
+
+        async function decodeFrameToCanvas(index, targetCtx, config) {
+            return new Promise((resolve, reject) => {
+                let keyIdx = index;
+                while (keyIdx >= 0 && !frames[keyIdx].keyframe) keyIdx--;
+                if (keyIdx < 0) { resolve(); return; }
+
+                let count = 0;
+                const target = index - keyIdx + 1;
+
+                const decoder = new VideoDecoder({
+                    output: frame => {
+                        try {
+                            if (++count === target) {
+                                targetCtx.drawImage(frame, 0, 0, targetCtx.canvas.width, targetCtx.canvas.height);
+                            }
+                        } finally {
+                            frame.close();
+                        }
+                        if (count >= target) {
+                            decoder.close();
+                            resolve();
+                        }
+                    },
+                    error: e => {
+                        try { decoder.close(); } catch { }
+                        reject(e);
+                    }
+                });
+
+                decoder.configure({ codec: config.codec, width: config.width, height: config.height });
+                for (let i = keyIdx; i <= index; i++) {
+                    decoder.decode(createChunk(frames[i]));
+                }
+                decoder.flush().catch(err => {
+                    try { decoder.close(); } catch { }
+                    reject(err);
+                });
+            });
         }
 
         // Events
@@ -611,40 +767,48 @@
                 .filter(f => f.name.toLowerCase().endsWith('.mp4'));
             if (!files.length) { alert('Please choose at least one MP4 file.'); return; }
 
-            // Remember currently selected file (if any) so we can restore selection after sorting
-            const currentFile = currentFileIndex >= 0 && currentFileIndex < loadedFiles.length
-                ? loadedFiles[currentFileIndex].file
-                : null;
+            // Build/update event groups keyed by recording timestamp (or filename)
+            const byKey = new Map(loadedFiles.map(entry => [entry.key, entry]));
 
-            // Add to in-memory file list (avoid simple duplicates by name+size)
             for (const file of files) {
-                const exists = loadedFiles.some(f => f.file.name === file.name && f.file.size === file.size);
-                if (exists) continue;
+                // Skip exact duplicates by name+size
+                if (Array.from(byKey.values()).some(e => e.files.some(f => f.file.name === file.name && f.file.size === file.size))) {
+                    continue;
+                }
+
                 const dt = parseRecordingDateFromName(file.name);
-                loadedFiles.push({
-                    file,
-                    sortKey: dt ? dt.getTime() : null
-                });
+                const tsPartMatch = file.name.match(/(\d{4}-\d{2}-\d{2}[_T]\d{2}-\d{2}-\d{2})/);
+                const key = tsPartMatch ? tsPartMatch[1] : file.name;
+                const camera = parseCameraFromName(file.name);
+
+                let entry = byKey.get(key);
+                if (!entry) {
+                    entry = {
+                        key,
+                        sortKey: dt ? dt.getTime() : null,
+                        files: []
+                    };
+                    byKey.set(key, entry);
+                }
+
+                entry.files.push({ file, camera });
             }
 
-            // Sort by recording time (newest first), unknown timestamps last by name
+            loadedFiles = Array.from(byKey.values());
+
+            // Sort by recording time (newest first), unknown timestamps last by key
             loadedFiles.sort((a, b) => {
                 if (a.sortKey && b.sortKey) return b.sortKey - a.sortKey;
                 if (a.sortKey && !b.sortKey) return -1;
                 if (!a.sortKey && b.sortKey) return 1;
-                return a.file.name.localeCompare(b.file.name);
+                return a.key.localeCompare(b.key);
             });
-
-            // Restore current selection index after sort
-            if (currentFile) {
-                currentFileIndex = loadedFiles.findIndex(e => e.file === currentFile);
-            }
 
             renderFileList();
 
-            // If nothing loaded yet, automatically load the first item (newest recording)
+            // If nothing loaded yet, automatically load the first item (newest event)
             if (currentFileIndex === -1 && loadedFiles.length) {
-                selectFile(0);
+                selectFile(0, null);
             }
         }
 
@@ -652,43 +816,79 @@
             fileListEl.innerHTML = '';
             if (!loadedFiles.length) return;
             loadedFiles.forEach((entry, index) => {
-                const file = entry.file;
+                const hasTimestamp = !!entry.sortKey;
+                const tsLabel = formatRecordingLabel(entry);
+
+                // Parent event row (selects grid / default view)
                 const btn = document.createElement('button');
                 btn.type = 'button';
-                btn.className = 'file-item' + (index === currentFileIndex ? ' active' : '');
+                btn.className = 'file-item' + (index === currentFileIndex && currentCamera === null ? ' active' : '');
 
                 const main = document.createElement('div');
                 main.className = 'file-item-main';
-                main.textContent = file.name;
+                main.textContent = tsLabel || entry.key;
 
                 const sub = document.createElement('div');
                 sub.className = 'file-item-sub';
-                const tsLabel = formatRecordingLabel(entry);
-                if (tsLabel) {
-                    sub.textContent = tsLabel;
-                } else {
-                    const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
-                    sub.textContent = `${sizeMb} MB`;
-                }
+                const cameras = entry.files
+                    .map(f => f.camera || 'clip')
+                    .filter((v, i, a) => a.indexOf(v) === i)
+                    .join(', ');
+                sub.textContent = hasTimestamp ? cameras : `${cameras} • ${entry.files.length} file${entry.files.length > 1 ? 's' : ''}`;
 
                 btn.appendChild(main);
                 btn.appendChild(sub);
-                btn.onclick = () => selectFile(index);
+                btn.onclick = () => selectFile(index, null);
                 fileListEl.appendChild(btn);
+
+                // Child rows for individual cameras/files
+                entry.files.forEach(({ file, camera }) => {
+                    const child = document.createElement('button');
+                    child.type = 'button';
+                    child.className = 'file-item file-item-child' +
+                        (index === currentFileIndex && currentCamera === (camera || file.name) ? ' active' : '');
+
+                    const cMain = document.createElement('div');
+                    cMain.className = 'file-item-main';
+                    cMain.textContent = camera ? camera.toUpperCase() : 'CLIP';
+
+                    const cSub = document.createElement('div');
+                    cSub.className = 'file-item-sub';
+                    cSub.textContent = file.name;
+
+                    child.appendChild(cMain);
+                    child.appendChild(cSub);
+                    child.onclick = () => selectFile(index, camera || file.name);
+                    fileListEl.appendChild(child);
+                });
             });
         }
 
-        function selectFile(index) {
+        function selectFile(index, cameraKey) {
             if (index < 0 || index >= loadedFiles.length) return;
             currentFileIndex = index;
+            currentCamera = cameraKey || null;
             renderFileList();
-            const file = loadedFiles[index].file;
-            loadFile(file);
+            const entry = loadedFiles[index];
+
+            // Always load a single file; tree is organizational only
+            let fileToLoad = null;
+            if (cameraKey) {
+                const hit = entry.files.find(f => (f.camera || f.file.name) === cameraKey);
+                fileToLoad = hit?.file || entry.files[0]?.file || null;
+            } else {
+                // Default: prefer front camera if available, else first file
+                const front = entry.files.find(f => f.camera === 'front');
+                fileToLoad = (front || entry.files[0])?.file || null;
+            }
+
+            loadFile(fileToLoad);
         }
 
         function clearFiles() {
             loadedFiles = [];
             currentFileIndex = -1;
+            currentCamera = null;
             fileListEl.innerHTML = '';
             pause();
             if (decoder) { try { decoder.close(); } catch { } decoder = null; }
@@ -696,6 +896,9 @@
             frames = null;
             firstKeyframe = 0;
             currentFileName = null;
+            videoGrid.classList.remove('active');
+            videoGrid.innerHTML = '';
+            canvas.style.display = '';
             slider.max = 0;
             slider.value = 0;
             slider.disabled = true;
@@ -722,6 +925,10 @@
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
             try {
+                videoGrid.classList.remove('active');
+                videoGrid.innerHTML = '';
+                canvas.style.display = '';
+
                 mp4 = new DashcamMP4(await file.arrayBuffer());
                 frames = mp4.parseFrames(seiType);
                 firstKeyframe = frames.findIndex(f => f.keyframe);
@@ -739,6 +946,7 @@
                 playBtn.disabled = false;
                 slider.disabled = false;
                 showFrame(firstKeyframe);
+                generateThumbnails().catch(() => { });
             } catch (err) {
                 mp4 = null;
                 frames = null;
@@ -779,10 +987,12 @@
         }
 
         function showFrame(index) {
-            frameNum.textContent = `Frame ${index + 1}/${frames.length}`;
-            renderSei(frames[index].sei);
-            if (decoding) { pendingFrame = index; return; }
-            decodeFrame(index);
+            if (!frames || !frames.length) return;
+            const clamped = Math.max(0, Math.min(frames.length - 1, index));
+            frameNum.textContent = `Frame ${clamped + 1}/${frames.length}`;
+            renderSei(frames[clamped].sei);
+            if (decoding) { pendingFrame = clamped; return; }
+            decodeFrame(clamped);
         }
 
         async function decodeFrame(index) {
